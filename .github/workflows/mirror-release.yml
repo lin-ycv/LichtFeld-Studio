@@ -1,0 +1,561 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Mirrors the latest stable MrNeRF/LichtFeld-Studio GitHub release into this fork,
+# builds the exact upstream release tag on Windows, and publishes:
+#   - a portable ZIP
+#   - an unsigned Inno Setup installer EXE
+#   - SHA-256 checksum files
+
+name: Mirror latest upstream release
+
+on:
+  schedule:
+    # Every Sunday at 03:23 UTC (11:23 in Taipei).
+    - cron: "23 3 * * 0"
+
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Rebuild/re-upload the current upstream latest release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-latest-upstream-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: MrNeRF/LichtFeld-Studio
+  FORK_BRANCH: master
+
+  BUILD_DIR: b
+  VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
+  VCPKG_BUILD_TYPE: release
+
+  CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+  CUDNN_ROOT_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+
+jobs:
+  detect:
+    name: Detect latest upstream release
+    runs-on: ubuntu-latest
+
+    outputs:
+      tag: ${{ steps.latest.outputs.tag }}
+      upstream_url: ${{ steps.latest.outputs.upstream_url }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+
+    steps:
+      - name: Read upstream Latest release
+        id: latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          release_json="$(gh api "repos/${UPSTREAM_REPO}/releases/latest")"
+
+          tag="$(jq -r '.tag_name' <<<"$release_json")"
+          upstream_url="$(jq -r '.html_url' <<<"$release_json")"
+
+          # LichtFeld stable release tags currently use versions such as v0.5.3.
+          # Fail closed if upstream changes to an unexpected tag format.
+          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){1,2}$ ]]; then
+            echo "::error::Unexpected upstream release tag: $tag"
+            exit 1
+          fi
+
+          echo "Latest upstream release: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_url=$upstream_url" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether fork release is already complete
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.latest.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          portable="LichtFeld-Studio-windows-${TAG}-portable.zip"
+          installer="LichtFeld-Studio-windows-${TAG}-setup.exe"
+
+          # gh release view returns non-zero if this fork does not yet have
+          # a GitHub Release for TAG. Using it inside `if` keeps set -e safe.
+          if release_json="$(
+            gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              2>/dev/null
+          )"; then
+
+            echo "Fork release $TAG exists."
+
+            # []? also makes this safe if the release has zero assets.
+            asset_names="$(jq -r '.assets[]?.name' <<<"$release_json")"
+
+            if grep -Fxq "$portable" <<<"$asset_names" &&
+               grep -Fxq "$installer" <<<"$asset_names"; then
+              echo "complete=true" >> "$GITHUB_OUTPUT"
+              echo "Fork release $TAG already contains both Windows packages."
+            else
+              echo "complete=false" >> "$GITHUB_OUTPUT"
+              echo "Fork release $TAG exists but is missing one or more expected assets."
+            fi
+
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+            echo "Fork release $TAG does not exist yet."
+          fi
+
+      - name: Decide whether to build
+        id: decide
+        shell: bash
+        env:
+          RELEASE_COMPLETE: ${{ steps.check.outputs.complete }}
+          FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild || false }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$FORCE_REBUILD" == "true" || "$RELEASE_COMPLETE" != "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "A build is required."
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing to do."
+          fi
+
+      - name: Sync fork master from upstream
+        if: steps.decide.outputs.should_build == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::FORK_SYNC_TOKEN repository secret is not configured."
+            exit 1
+          fi
+
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f branch="${FORK_BRANCH}" \
+            --jq '.message'
+
+  build:
+    name: Build and publish Windows packages
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: true
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+
+      - name: Fetch exact upstream tag and mirror it into fork
+        shell: pwsh
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tag = $env:TAG
+
+          if (-not $tag) {
+            throw "TAG environment variable is empty."
+          }
+
+          Write-Host "Upstream release tag: $tag"
+
+          if ((git remote) -contains 'upstream') {
+            git remote set-url upstream "https://github.com/$env:UPSTREAM_REPO.git"
+          }
+          else {
+            git remote add upstream "https://github.com/$env:UPSTREAM_REPO.git"
+          }
+
+          # Fetch the exact upstream tag.
+          $refspec = "refs/tags/${tag}:refs/tags/${tag}"
+
+          Write-Host "Fetching $refspec"
+
+          git fetch --force upstream $refspec
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to fetch upstream tag $tag"
+          }
+
+          # Resolve the tag to the commit it actually points to.
+          $commit = (git rev-list -n 1 "refs/tags/$tag").Trim()
+
+          if (-not $commit) {
+            throw "Could not resolve $tag to a commit."
+          }
+
+          Write-Host "Upstream tag $tag resolves to $commit"
+
+          # Mirror the exact tag into the fork.
+          git push origin $refspec
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not mirror $tag into the fork. Check for a conflicting tag."
+          }
+
+          # Build the release tag itself, not master.
+          git checkout --force "refs/tags/$tag"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to checkout $tag"
+          }
+
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to initialize submodules."
+          }
+
+          "UPSTREAM_COMMIT=$commit" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "Building upstream $tag at $commit"
+
+      - name: Install CUDA 12.8
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda-12.8.exe'
+
+          Invoke-WebRequest `
+            'https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe' `
+            -OutFile $installer
+
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList '-y -s -accepteula -toolkit -override -noDisplayDriver' `
+            -Wait `
+            -PassThru
+
+          if ($process.ExitCode -ne 0) {
+            throw "CUDA installer failed with exit code $($process.ExitCode)."
+          }
+
+          $cuda = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
+
+          "CUDA_PATH=$cuda" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_PATH_V12_8=$cuda" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDNN_ROOT_DIR=$cuda" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          "$cuda\bin" |
+            Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          "$cuda\libnvvp" |
+            Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install cuDNN 9 for CUDA 12
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $zip = Join-Path $env:RUNNER_TEMP 'cudnn.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'cudnn'
+
+          Invoke-WebRequest `
+            'https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.5.0.50_cuda12-archive.zip' `
+            -OutFile $zip
+
+          Expand-Archive $zip -DestinationPath $extract -Force
+
+          $root = Get-ChildItem $extract -Directory | Select-Object -First 1
+          if (-not $root) {
+            throw 'Could not locate the extracted cuDNN directory.'
+          }
+
+          Copy-Item "$($root.FullName)\bin\*" `
+            "$env:CUDA_PATH\bin" -Recurse -Force
+          Copy-Item "$($root.FullName)\include\*" `
+            "$env:CUDA_PATH\include" -Recurse -Force
+          Copy-Item "$($root.FullName)\lib\x64\*" `
+            "$env:CUDA_PATH\lib\x64" -Recurse -Force
+
+          if (-not (Test-Path "$env:CUDA_PATH\include\cudnn.h")) {
+            throw 'cuDNN installation failed: cudnn.h was not found.'
+          }
+
+      - name: Cache vcpkg tool
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.VCPKG_ROOT }}
+          key: lichtfeld-vcpkg-tool-windows-2022-v1
+
+      - name: Set up vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (-not (Test-Path "$env:VCPKG_ROOT\.git")) {
+            git clone https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Failed to clone vcpkg.'
+            }
+          }
+
+          if (-not (Test-Path "$env:VCPKG_ROOT\vcpkg.exe")) {
+            & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Failed to bootstrap vcpkg.'
+            }
+          }
+
+      - name: Cache built vcpkg dependencies
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.BUILD_DIR }}/vcpkg_installed
+          key: lichtfeld-vcpkg-installed-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/overlays/**') }}
+          restore-keys: |
+            lichtfeld-vcpkg-installed-${{ runner.os }}-
+
+      - name: Configure portable Release build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -B %BUILD_DIR% -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PORTABLE=ON -DBUILD_PYTHON_STUBS=OFF
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build %BUILD_DIR% -j %NUMBER_OF_PROCESSORS%
+
+      - name: Create portable ZIP
+        id: portable
+        shell: pwsh
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (Test-Path dist) {
+            Remove-Item dist -Recurse -Force
+          }
+
+          cmake --install $env:BUILD_DIR --prefix dist
+          if ($LASTEXITCODE -ne 0) {
+            throw 'cmake --install failed.'
+          }
+
+          if (-not (Test-Path 'dist\bin\LichtFeld-Studio.exe')) {
+            throw 'Expected dist\bin\LichtFeld-Studio.exe was not produced.'
+          }
+
+          $portable = "LichtFeld-Studio-windows-$env:TAG-portable.zip"
+
+          if (Test-Path $portable) {
+            Remove-Item $portable -Force
+          }
+
+          Compress-Archive `
+            -Path 'dist\*' `
+            -DestinationPath $portable `
+            -CompressionLevel Optimal
+
+          "portable=$portable" >> $env:GITHUB_OUTPUT
+
+      - name: Create installer EXE with Inno Setup
+        id: installer
+        shell: pwsh
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $version = $env:TAG -replace '^v', ''
+          $outputBase = "LichtFeld-Studio-windows-$env:TAG-setup"
+
+          # Generate the .iss installer recipe on the runner so this workflow
+          # remains the only custom file you need to maintain in the fork.
+          $iss = @"
+          [Setup]
+          AppId=LichtFeldStudio-${env:GITHUB_REPOSITORY_OWNER}-Unofficial
+          AppName=LichtFeld Studio
+          AppVerName=LichtFeld Studio $version
+          AppVersion=$version
+          AppPublisher=${env:GITHUB_REPOSITORY_OWNER} (unofficial build)
+          AppPublisherURL=https://github.com/$env:GITHUB_REPOSITORY
+          DefaultDirName={autopf}\LichtFeld Studio
+          DefaultGroupName=LichtFeld Studio
+          DisableProgramGroupPage=yes
+          UninstallDisplayIcon={app}\bin\LichtFeld-Studio.exe
+          LicenseFile=dist\LICENSE
+          OutputDir=installer-output
+          OutputBaseFilename=$outputBase
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          PrivilegesRequired=admin
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
+
+          [Files]
+          Source: "dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\LichtFeld Studio"; Filename: "{app}\bin\LichtFeld-Studio.exe"; WorkingDir: "{app}\bin"
+          Name: "{autodesktop}\LichtFeld Studio"; Filename: "{app}\bin\LichtFeld-Studio.exe"; WorkingDir: "{app}\bin"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\bin\LichtFeld-Studio.exe"; Description: "Launch LichtFeld Studio"; Flags: nowait postinstall skipifsilent
+          "@
+
+          $iss |
+            Set-Content -Path 'lichtfeld-generated.iss' -Encoding utf8
+
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+
+          if (-not (Test-Path $iscc)) {
+            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($cmd) {
+              $iscc = $cmd.Source
+            } else {
+              throw 'Inno Setup compiler (ISCC.exe) was not found on the runner.'
+            }
+          }
+
+          & $iscc 'lichtfeld-generated.iss'
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Inno Setup failed.'
+          }
+
+          $installer = "installer-output\$outputBase.exe"
+
+          if (-not (Test-Path $installer)) {
+            throw "Expected installer was not produced: $installer"
+          }
+
+          "installer=$installer" >> $env:GITHUB_OUTPUT
+
+      - name: Generate SHA-256 checksums
+        shell: pwsh
+        env:
+          PORTABLE: ${{ steps.portable.outputs.portable }}
+          INSTALLER: ${{ steps.installer.outputs.installer }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          foreach ($file in @($env:PORTABLE, $env:INSTALLER)) {
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $file).Hash.ToLowerInvariant()
+            $leaf = Split-Path $file -Leaf
+
+            Set-Content `
+              -Path "${file}.sha256" `
+              -Value "$hash  $leaf" `
+              -Encoding ascii
+          }
+
+      - name: Create or update release in fork
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          UPSTREAM_URL: ${{ needs.detect.outputs.upstream_url }}
+          PORTABLE: ${{ steps.portable.outputs.portable }}
+          INSTALLER: ${{ steps.installer.outputs.installer }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $notes = @"
+          Unofficial Windows build of LichtFeld Studio.
+
+          Built from the official upstream release tag: $env:TAG
+          Upstream release: $env:UPSTREAM_URL
+          Upstream commit: $env:UPSTREAM_COMMIT
+
+          Assets:
+          - Portable ZIP
+          - Windows installer EXE
+          - SHA-256 checksum files
+
+          This release is built automatically from the public GPL-3.0-or-later source and is not an official binary distributed by the LichtFeld Studio project.
+          "@
+
+          $notes |
+            Set-Content 'release-notes.md' -Encoding utf8
+
+          $assets = @(
+            $env:PORTABLE,
+            "${env:PORTABLE}.sha256",
+            $env:INSTALLER,
+            "${env:INSTALLER}.sha256"
+          )
+
+          gh release view $env:TAG `
+            --repo $env:GITHUB_REPOSITORY *> $null
+
+          $releaseExists = ($LASTEXITCODE -eq 0)
+
+          if ($releaseExists) {
+            gh release upload $env:TAG @assets `
+              --repo $env:GITHUB_REPOSITORY `
+              --clobber
+
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Failed to upload release assets.'
+            }
+
+            gh release edit $env:TAG `
+              --repo $env:GITHUB_REPOSITORY `
+              --title "LichtFeld Studio $env:TAG - Unofficial Windows Build" `
+              --notes-file 'release-notes.md' `
+              --latest
+
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Failed to update release metadata.'
+            }
+          } else {
+            gh release create $env:TAG @assets `
+              --repo $env:GITHUB_REPOSITORY `
+              --title "LichtFeld Studio $env:TAG - Unofficial Windows Build" `
+              --notes-file 'release-notes.md' `
+              --verify-tag `
+              --latest
+
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Failed to create release.'
+            }
+          }
+
+      - name: Publish workflow summary
+        shell: pwsh
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+          PORTABLE: ${{ steps.portable.outputs.portable }}
+          INSTALLER: ${{ steps.installer.outputs.installer }}
+        run: |
+          @(
+            "### Mirrored upstream release $env:TAG"
+            ""
+            "- Commit: ``$env:UPSTREAM_COMMIT``"
+            "- Portable: ``$env:PORTABLE``"
+            "- Installer: ``$env:INSTALLER``"
+          ) |
+            Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
