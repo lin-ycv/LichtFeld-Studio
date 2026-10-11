@@ -16,11 +16,13 @@
 #include "gui/rmlui/elements/python_editor_element.hpp"
 #include "gui/rmlui/elements/scene_graph_element.hpp"
 #include "gui/rmlui/elements/terminal_element.hpp"
+#include "gui/rmlui/elements/viewport_select.hpp"
 #include "gui/rmlui/elements/vram_timeline_element.hpp"
 #include "gui/rmlui/rml_document_utils.hpp"
 #include "gui/rmlui/rml_input_utils.hpp"
 #include "gui/rmlui/rml_text_input_handler.hpp"
 #include "gui/rmlui/rmlui_system_interface.hpp"
+#include "input/sdl_coordinate_utils.hpp"
 #include "internal/resource_paths.hpp"
 #include "python/python_runtime.hpp"
 
@@ -231,6 +233,8 @@ namespace lfs::vis::gui {
         static Rml::ElementInstancerGeneric<TextFieldNotingEmoji<Rml::ElementFormControlTextArea>> textarea_instancer;
         Rml::Factory::RegisterElementInstancer("input", &input_instancer);
         Rml::Factory::RegisterElementInstancer("textarea", &textarea_instancer);
+        static Rml::ElementInstancerGeneric<ViewportSelect> select_instancer;
+        Rml::Factory::RegisterElementInstancer("select", &select_instancer);
         static Rml::ElementInstancerGeneric<ChromaticityElement> chromaticity_instancer;
         static Rml::ElementInstancerGeneric<ColorPickerElement> color_picker_instancer;
         static Rml::ElementInstancerGeneric<CRFCurveElement> crf_curve_instancer;
@@ -297,9 +301,7 @@ namespace lfs::vis::gui {
                 const auto& blob = font_blobs_.back();
                 Rml::Span<const Rml::byte> data{
                     reinterpret_cast<const Rml::byte*>(blob.data()), blob.size()};
-                if (Rml::LoadFontFace(data, specs[i].family, specs[i].style, specs[i].weight, specs[i].fallback)) {
-                    LOG_INFO("RmlUI: loaded font {}", loaded.path.string());
-                } else {
+                if (!Rml::LoadFontFace(data, specs[i].family, specs[i].style, specs[i].weight, specs[i].fallback)) {
                     LOG_WARN("RmlUI: failed to register {}", loaded.path.string());
                 }
             }
@@ -308,7 +310,6 @@ namespace lfs::vis::gui {
         }
 
         initialized_ = true;
-        LOG_INFO("RmlUI initialized");
         return true;
     }
 
@@ -366,7 +367,6 @@ namespace lfs::vis::gui {
                 reinterpret_cast<const Rml::byte*>(blob.data()), blob.size()};
             if (Rml::LoadFontFace(data, specs[i].family, Rml::Style::FontStyle::Normal,
                                   Rml::Style::FontWeight::Normal, true)) {
-                LOG_INFO("RmlUI: loaded CJK font {}", loaded.path.string());
                 any_loaded = true;
             } else {
                 LOG_WARN("RmlUI: failed to register {}", loaded.path.string());
@@ -500,8 +500,6 @@ namespace lfs::vis::gui {
         resize_deferring_ = false;
         vulkan_frame_active_ = false;
         initialized_ = false;
-
-        LOG_INFO("RmlUI shut down");
     }
 
     void RmlUIManager::setDpRatio(float ratio) {
@@ -1051,7 +1049,8 @@ namespace lfs::vis::gui {
         }
     }
 
-    RmlUIManager::InputDispatchResult RmlUIManager::dispatchInputEvent(const SDL_Event& event) {
+    RmlUIManager::InputDispatchResult RmlUIManager::dispatchInputEvent(const SDL_Event& native_event) {
+        const SDL_Event event = input::pointerEventInPixels(native_event, window_);
         flushInputLifecycle();
         input_dispatch_active_ = true;
         struct FinishDispatch {
@@ -1446,6 +1445,19 @@ namespace lfs::vis::gui {
             if (!command.context)
                 continue;
 
+            // Popup layout must use the visible window, not the shadow-padded
+            // context. Full-context caches retain their native coordinate space.
+            const bool visible_region = !command.cache || command.cache_visible_region;
+            const float viewport_top = visible_region
+                                           ? std::max(0.0f, command.clip_enabled ? command.clip_y1 : 0.0f) - command.offset_y
+                                           : 0.0f;
+            const float viewport_bottom = visible_region
+                                              ? std::min(static_cast<float>(vulkan_frame_extent_.height),
+                                                         command.clip_enabled ? command.clip_y2 : static_cast<float>(vulkan_frame_extent_.height)) -
+                                                    command.offset_y
+                                              : static_cast<float>(command.context->GetDimensions().y);
+            const SelectViewportScope select_viewport(viewport_top, viewport_bottom);
+
             const std::string timer_name = std::string("gui_render.rmlui_record.") +
                                            (foreground ? "foreground.context." : "background.context.") +
                                            command.context_name;
@@ -1505,7 +1517,7 @@ namespace lfs::vis::gui {
                         vulkan_render_interface_->BeginCacheCapture(left, top, vis_w, vis_h);
                         vulkan_render_interface_->SetContextOffset(command.offset_x, command.offset_y);
                         vulkan_render_interface_->SetContextClipRect(fleft, ftop, fright, fbottom);
-                        const Rml::LayerHandle layer = vulkan_render_interface_->PushLayer();
+                        const Rml::LayerHandle layer = vulkan_render_interface_->PushContextLayer();
                         if (layer != 0) {
                             command.context->Render();
                             const Rml::TextureHandle saved_texture =
@@ -1590,7 +1602,7 @@ namespace lfs::vis::gui {
                                                                  0.0f,
                                                                  static_cast<float>(command.cache_width),
                                                                  static_cast<float>(command.cache_height));
-                    const Rml::LayerHandle layer = vulkan_render_interface_->PushLayer();
+                    const Rml::LayerHandle layer = vulkan_render_interface_->PushContextLayer();
                     if (layer != 0) {
                         command.context->Render();
                         const Rml::TextureHandle saved_texture =

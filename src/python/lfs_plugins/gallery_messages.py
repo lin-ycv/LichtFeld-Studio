@@ -29,9 +29,21 @@ def localize_message(message):
     if text.startswith("gallery_project_"):
         key = {"gallery_project_no_splats": "eligibility.no_splats",
                "gallery_project_payload_unavailable": "eligibility.external_payloads",
+               "gallery_project_hdr_unavailable": "eligibility.hdr_missing",
                "gallery_project_not_supported": "eligibility.format",
                "gallery_project_commit_mismatch": "error.project_changed"}.get(text.split(":", 1)[0])
         return tr(key) if key else text
+    from .gallery_storage import is_localized_storage_message, is_storage_error, storage_message
+    portal_text = text.startswith("gallery_portal:")
+    if portal_text:
+        text = text.removeprefix("gallery_portal:")
+    if is_localized_storage_message(text):
+        return text
+    if is_storage_error(text):
+        translated = storage_message(text)
+        return text if translated.startswith("projects.gallery.") else translated
+    if portal_text:
+        return text  # Unknown portal sentences must survive all diagnostic heuristics.
     lower = text.casefold()
     if any(message in lower for message in ('pinned representation', 'pinned download', 'restarted this download')):
         return text  # Keep the explanation of restart versus resume visible.

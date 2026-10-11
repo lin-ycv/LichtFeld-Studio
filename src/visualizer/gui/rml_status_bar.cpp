@@ -18,6 +18,7 @@
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/rmlui/sdl_rml_key_mapping.hpp"
 #include "gui/status_bar_mining.hpp"
+#include "gui/status_bar_training.hpp"
 #include "gui/string_keys.hpp"
 #include "gui/ui_context.hpp"
 #include "internal/resource_paths.hpp"
@@ -1233,7 +1234,10 @@ namespace lfs::vis::gui {
         std::string mode_rml;
         std::string mode_color;
 
-        if (content_type == SceneManager::ContentType::Empty) {
+        if (viewer && viewer->isTrainingStartPending()) {
+            mode_rml = LOC("training_panel.preparing_training");
+            mode_color = colorToRml(p.info);
+        } else if (content_type == SceneManager::ContentType::Empty) {
             mode_rml = LOC("mode.empty");
             mode_color = colorToRml(p.text_dim);
         } else if (content_type == SceneManager::ContentType::SplatFiles) {
@@ -1279,13 +1283,18 @@ namespace lfs::vis::gui {
                 break;
             }
             case TrainingState::Starting:
-                mode_rml = LOC("runtime.task_starting_ellipsis") + suffix;
+                mode_rml = LOC("training_panel.preparing_training");
                 mode_color = colorToRml(p.warning);
                 break;
-            case TrainingState::Finished:
-                mode_rml = LOC(lichtfeld::Strings::Status::COMPLETE) + suffix;
-                mode_color = colorToRml(p.success);
+            case TrainingState::Finished: {
+                const auto reason = tm
+                                        ? tm->getStateMachine().getFinishReason()
+                                        : FinishReason::None;
+                const auto status = finishedTrainingStatus(reason, p);
+                mode_rml = LOC(status.label_key) + suffix;
+                mode_color = colorToRml(status.color);
                 break;
+            }
             case TrainingState::Stopping:
                 mode_rml = LOC(lichtfeld::Strings::Status::STOPPING) + suffix;
                 mode_color = colorToRml(p.text_dim);

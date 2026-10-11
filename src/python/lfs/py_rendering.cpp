@@ -773,8 +773,6 @@ namespace lfs::python {
         add_float(&Proxy::voxel_size, "voxel_size", "Point Size", "Point size in point cloud mode", 0.01, 0.001, 0.1);
 
         // Selection Colors
-        add_color3(&Proxy::selection_color_committed, "selection_color_committed", "Committed",
-                   "Committed selection color", {0.859, 0.325, 0.325});
         add_color3(&Proxy::selection_color_preview, "selection_color_preview", "Preview", "Preview selection color",
                    {0.0, 0.871, 0.298});
         add_color3(&Proxy::selection_color_center_marker, "selection_color_center_marker", "Center Marker",
@@ -946,7 +944,14 @@ namespace lfs::python {
             settings_.gut = rendering::isGutBackend(
                 static_cast<rendering::GaussianRasterBackend>(settings_.raster_backend));
         }
-        vis::update_render_settings(settings_);
+        try {
+            vis::update_render_settings(settings_);
+        } catch (...) {
+            if (const auto applied = vis::get_render_settings()) {
+                settings_ = *applied;
+            }
+            throw;
+        }
         // update_render_settings may normalize dependent properties (for
         // example the preset when switching scene reconstruction backends).
         // Keep this Python proxy in lockstep with that applied state so the
@@ -1601,8 +1606,13 @@ namespace lfs::python {
         int target_width = width;
         int target_height = height;
 
+        const auto render_settings = vis::get_render_settings();
+        const bool split_view =
+            render_settings && render_settings->split_view_mode != static_cast<int>(vis::SplitViewMode::Disabled);
+
         core::Tensor image;
-        if (!transparent && target_width <= 0 && target_height <= 0) {
+        // Only the live viewport composes split-view panels; every other export renders the scene.
+        if (!transparent && target_width <= 0 && target_height <= 0 && split_view) {
             auto captured = viewportRenderImageHwc(captureViewportRenderThreadSafe(), true);
             if (!captured || !captured->is_valid()) {
                 throw std::runtime_error("viewport capture failed");
@@ -1649,7 +1659,6 @@ namespace lfs::python {
                         vis::ExportPostProcessMode::Transparent);
                 }
             } else {
-                const auto render_settings = vis::get_render_settings();
                 const bool export_hdr_environment =
                     render_settings &&
                     render_settings->environment_mode ==

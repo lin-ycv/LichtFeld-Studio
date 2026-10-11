@@ -265,6 +265,45 @@ TEST_F(PipelinedImageLoaderTest, UndistortedTrainingImageIsIdenticalForImmediate
     expect_identical(cold.tensor, hit.tensor);
 }
 
+// Catches decode-ahead changing what a load returns: with the image decoded ahead on the host, every CPU decode
+// branch (8-bit, 16-bit, float for undistortion) must return exactly the image a plain load returns.
+TEST_F(PipelinedImageLoaderTest, DecodeAheadReturnsTheSameImageAsAPlainLoad) {
+    const auto [width, height, channels] = lfs::core::get_image_info(mask_path_);
+    ASSERT_GT(width, 0);
+    ASSERT_GT(height, 0);
+    const float focal = 0.9765625f * static_cast<float>(width);
+    const auto undistort = lfs::core::compute_undistort_params(
+        focal, focal, 0.5f * width, 0.5f * height, width, height,
+        Tensor::from_vector({0.10f, -0.33f, 0.85f}, {3}, Device::CPU),
+        Tensor::from_vector({0.001f, -0.001f}, {2}, Device::CPU),
+        CameraModelType::PINHOLE, 0.0f);
+    LoadParams resized;
+    resized.max_width = 16;
+    resized.output_uint8 = false;
+    LoadParams undistorted;
+    undistorted.output_uint8 = true;
+    undistorted.undistort = &undistort;
+
+    for (const bool sixteen_bit : {false, true}) {
+        auto settings = config();
+        settings.use_16bit_color = sixteen_bit;
+        for (const auto* params : {&resized, &undistorted}) {
+            PipelinedImageLoader plain(settings);
+            const auto expected = plain.load_image_immediate(mask_path_, *params).cpu().contiguous();
+
+            PipelinedImageLoader ahead(settings);
+            ahead.decode_ahead(image_path_, *params);
+            ahead.decode_ahead(mask_path_, *params);
+            const auto actual = ahead.load_image_immediate(mask_path_, *params).cpu().contiguous();
+            ASSERT_EQ(actual.shape(), expected.shape());
+            ASSERT_EQ(actual.dtype(), expected.dtype());
+            EXPECT_EQ(std::memcmp(actual.data_ptr(), expected.data_ptr(), expected.bytes()), 0)
+                << "16-bit " << sixteen_bit << ", undistorted " << (params == &undistorted);
+            EXPECT_EQ(ahead.get_stats().cpu_decode_calls, plain.get_stats().cpu_decode_calls);
+        }
+    }
+}
+
 // Fails if a release frees nothing, spills a newer image before the oldest, or
 // loses pixels on the way through the spill.
 TEST_F(PipelinedImageLoaderTest, ReleaseHostCacheSpillsLeastRecentImagesFirst) {
@@ -400,6 +439,38 @@ TEST_F(PipelinedImageLoaderTest, SixteenBitPngDownscalesWithGpuLanczosAtFullPrec
         Tensor::from_blob(source.data(), TensorShape({HEIGHT, WIDTH, 3}), Device::CPU, DataType::Float32).to(Device::CUDA),
         target_height, target_width, 2, nullptr);
     EXPECT_EQ(expected.cpu().to_vector(), actual.cpu().to_vector());
+}
+
+// Catches an immediate load that returns the lossy JPEG copy training cached for the same image although
+// the caller asked to bypass the cache, which evaluation references do.
+TEST_F(PipelinedImageLoaderTest, SkipBlobCacheIgnoresTheTrainingJpegCopy) {
+    constexpr int WIDTH = 64;
+    constexpr int HEIGHT = 48;
+    const lfs::test::licht::TemporaryDirectory temp("lfs-skip-blob-cache");
+    const auto png_path = temp.path / "image.png";
+    std::vector<uint8_t> pixels(static_cast<size_t>(WIDTH) * HEIGHT * 3);
+    for (size_t index = 0; index < pixels.size(); ++index)
+        pixels[index] = static_cast<uint8_t>((index * 2654435761u) >> 24);
+    ASSERT_TRUE(save_png(png_path, pixels.data(), WIDTH, HEIGHT, 3, 8, 1));
+
+    LoadParams params;
+    params.max_width = 40;
+    params.output_uint8 = true;
+    const auto lossless = PipelinedImageLoader(config()).load_image_immediate(png_path, params).cpu().to_vector_uint8();
+
+    PipelinedImageLoader loader(config());
+    ImageRequest request;
+    request.sequence_id = 0;
+    request.path = png_path;
+    request.params = params;
+    loader.prefetch({request});
+    const auto trained = loader.get();
+    ASSERT_TRUE(trained.error.empty()) << trained.error;
+    ASSERT_NE(loader.load_image_immediate(png_path, params).cpu().to_vector_uint8(), lossless)
+        << "training no longer caches a lossy copy, so this test checks nothing";
+
+    params.skip_blob_cache = true;
+    EXPECT_EQ(loader.load_image_immediate(png_path, params).cpu().to_vector_uint8(), lossless);
 }
 
 // Catches the alpha-as-mask path resizing RGBA on the host: its RGB would then differ

@@ -6,6 +6,7 @@
 
 #include "camera_interaction_service.hpp"
 #include "core/cuda/undistort/undistort.hpp"
+#include "core/error.hpp"
 #include "core/event_bridge/scoped_handler.hpp"
 #include "core/export.hpp"
 #include "core/tensor.hpp"
@@ -55,6 +56,7 @@ namespace lfs::core {
     class Camera;
     class Scene;
     class SplatData;
+    struct SplatLodTree;
     class Tensor;
 } // namespace lfs::core
 
@@ -87,7 +89,7 @@ namespace lfs::vis {
         struct RenderContext {
             const Viewport& viewport;
             const RenderSettings& settings;
-            glm::ivec2 logical_screen_size{0, 0};
+            glm::ivec2 screen_size_px{0, 0};
             const ViewportRegion* viewport_region = nullptr;
             SceneManager* scene_manager = nullptr;
             VulkanContext* vulkan_context = nullptr;
@@ -279,17 +281,12 @@ namespace lfs::vis {
             animation_state_.setPivotAnimationEndTime(end_time);
         }
 
-        void triggerSelectionFlash() {
-            markDirty(animation_state_.triggerSelectionFlash(), lfs::vis::FrameReason::Selection);
-        }
-
         void setOverlayAnimationActive(const bool active) { animation_state_.setOverlayAnimationActive(active); }
 
-        [[nodiscard]] float getSelectionFlashIntensity() const {
-            return animation_state_.selectionFlashIntensity();
-        }
+        // Interactive edits validate changed environment maps before committing settings.
+        [[nodiscard]] lfs::Result<void> updateSettingsFromUser(const RenderSettings& settings);
 
-        // Settings management
+        // Settings management (also used for restoring saved state).
         void updateSettings(const RenderSettings& settings);
         void updateSettings(const RenderSettings& settings, DirtyMask dirty_flags);
         RenderSettings getSettings() const;
@@ -312,6 +309,7 @@ namespace lfs::vis {
         [[nodiscard]] std::optional<SplitViewInfo> getSplitViewInfoIfChanged(std::uint64_t& generation) const;
         [[nodiscard]] bool isSplitViewActive() const;
         [[nodiscard]] bool isGTComparisonActive() const;
+        [[nodiscard]] bool hasGTComparisonAvailable() const;
         [[nodiscard]] bool isPLYComparisonActive() const;
         [[nodiscard]] bool isIndependentSplitViewActive() const;
         [[nodiscard]] GTComparisonMode getGTComparisonMode() const;
@@ -459,7 +457,7 @@ namespace lfs::vis {
         int pickCameraFrustum(const glm::vec2& mouse_pos);
 
         // Depth access for tools (returns camera-space depth at pixel, or -1 if invalid).
-        float getDepthAtPixel(int x, int y, std::optional<SplitViewPanelId> panel = std::nullopt) const;
+        float getDepthAtPixel(int x, int y, std::optional<SplitViewPanelId> panel = std::nullopt, bool nonblocking = false) const;
         struct ExpectedDepthSampleRequest {
             SceneManager* scene_manager = nullptr;
             const Viewport* viewport = nullptr;
@@ -498,7 +496,7 @@ namespace lfs::vis {
                                    lfs::core::Tensor* selection_tensor = nullptr,
                                    bool saturation_mode = false, float saturation_amount = 0.0f,
                                    std::optional<SplitViewPanelId> panel = std::nullopt,
-                                   int focused_gaussian_id = -1, bool request_render = true);
+                                   int focused_gaussian_id = -1, bool highlight_splats = true);
         void clearCursorPreviewState();
         [[nodiscard]] bool isCursorPreviewActive() const { return viewport_overlay_service_.isCursorPreviewActive(); }
         [[nodiscard]] std::optional<SplitViewPanelId> getCursorPreviewPanel() const {
@@ -584,18 +582,12 @@ namespace lfs::vis {
             lfs::vis::VulkanDepthBlitParams depth_blit;
             lfs::vis::VulkanSplitViewParams split_view;
         };
-        void setVulkanMeshFrame(VulkanMeshFrame frame) {
-            std::lock_guard lock(vulkan_mesh_frame_mutex_);
-            vulkan_mesh_frame_ = std::move(frame);
-        }
+        void setVulkanMeshFrame(VulkanMeshFrame frame);
         [[nodiscard]] VulkanMeshFrame getVulkanMeshFrame() const {
             std::lock_guard lock(vulkan_mesh_frame_mutex_);
             return vulkan_mesh_frame_;
         }
-        void clearVulkanMeshFrame() {
-            std::lock_guard lock(vulkan_mesh_frame_mutex_);
-            vulkan_mesh_frame_ = {};
-        }
+        void clearVulkanMeshFrame();
 
         // Preview selection
         void setPreviewSelection(lfs::core::Tensor* preview, bool add_mode = true) {
@@ -614,6 +606,12 @@ namespace lfs::vis {
         }
         [[nodiscard]] SelectionPreviewMode getSelectionPreviewMode() const {
             return viewport_overlay_service_.selectionPreviewMode();
+        }
+        void setGaussianSelectionVisible(const bool visible) {
+            if (gaussian_selection_visible_ == visible)
+                return;
+            gaussian_selection_visible_ = visible;
+            markDirty(DirtyFlag::SELECTION, lfs::vis::FrameReason::Selection);
         }
         [[nodiscard]] int getHoveredGaussianId() const { return viewport_overlay_service_.hoveredGaussianId(); }
 
@@ -681,6 +679,11 @@ namespace lfs::vis {
                                            glm::ivec2 alloc_size = {0, 0});
         [[nodiscard]] float exportRasterizationScale(int target_height, int reference_height) const;
         [[nodiscard]] std::optional<float> exportOrthoScale(std::optional<float> scale, int target_height, int reference_height) const;
+        // Draws the visible meshes over a finished export image, depth-tested against the splats.
+        [[nodiscard]] lfs::Status compositeExportMeshes(
+            SceneManager* scene_manager,
+            const ExportImageRequest& request,
+            lfs::core::Tensor& image);
 
         std::shared_ptr<lfs::core::Tensor> renderPreviewImageWithState(
             SceneManager* scene_manager,
@@ -865,6 +868,16 @@ namespace lfs::vis {
         std::unique_ptr<PointCloudVulkanRenderer> point_cloud_vulkan_renderer_;
         std::unique_ptr<SparkLodController> lod_controller_;
         const lfs::core::SplatData* lod_controller_model_ = nullptr;
+        // Offscreen renders have no LOD cut, so an LOD-tree model draws through its leaf view.
+        [[nodiscard]] std::shared_ptr<const lfs::core::SplatData> lodLeafRenderView(const lfs::core::SplatData& model);
+        // The view shares its source's tensors; keep it only while that model is still rendered.
+        void releaseLodLeafRenderViewUnlessFor(const lfs::core::SplatData* model);
+        std::mutex lod_leaf_view_mutex_;
+        const lfs::core::SplatData* lod_leaf_view_source_ = nullptr;
+        const lfs::core::SplatLodTree* lod_leaf_view_tree_ = nullptr;
+        std::size_t lod_leaf_view_rows_ = 0;
+        std::uint64_t lod_leaf_view_deleted_version_ = 0;
+        std::shared_ptr<const lfs::core::SplatData> lod_leaf_view_;
         bool lod_controller_needs_sync_traversal_ = false;
         std::uint64_t lod_controller_page_map_generation_ = 0;
         // Cached SH0→RGB derivation for the point-cloud Vulkan path. Refreshed
@@ -1002,11 +1015,13 @@ namespace lfs::vis {
         ViewportInteractionContext viewport_interaction_context_;
 
         ViewportOverlayService viewport_overlay_service_;
+        bool gaussian_selection_visible_ = true;
 
         lfs::event::ScopedHandler event_handlers_;
 
         friend class RenderingManagerEventsTest_SceneClearedResetsFrustumLoaderSyncCache_Test;
         friend class SceneManager;
+        friend struct SplitOutputLifetimeTestAccess;
     };
 
 } // namespace lfs::vis

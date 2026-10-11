@@ -10,6 +10,7 @@
 #include "core/path_utils.hpp"
 #include "core/services.hpp"
 #include "gui/gui_manager.hpp"
+#include "gui/rml_modal_overlay.hpp"
 #include "io/splat_path.hpp"
 #include "scene/scene_manager.hpp"
 #include "visualizer_impl.hpp"
@@ -58,13 +59,25 @@ namespace lfs::vis {
 
     void DataLoadingService::handleLoadFileCommand(
         const lfs::core::events::cmd::LoadFile& cmd) {
-        // Resolve replacement only when this batch reaches the front. An earlier
-        // import may still be establishing the first scene node.
-        if (cmd.user_batch && cmd.paths.size() > 1 && !cmd.is_dataset && viewer_ && viewer_->getGuiManager() &&
-            viewer_->getGuiManager()->asyncTasks().isImporting()) {
+        // user_batch marks UI-drop origin, including single files and their
+        // confirmation continuations. API requests retain busy rejection.
+        // New drops wait for the backlog and modal, even between imports. A
+        // confirmed drop resumes ahead of later arrivals once the loader is idle.
+        if (cmd.user_batch && !cmd.is_dataset && !isCheckpointFile(cmd.path) && viewer_ && viewer_->getGuiManager() &&
+            (viewer_->getGuiManager()->asyncTasks().isImporting() ||
+             (!cmd.discard_changes &&
+              (!pending_imports_.empty() ||
+               (viewer_->getGuiManager()->modalOverlay() &&
+                (viewer_->getGuiManager()->modalOverlay()->isOpen() ||
+                 viewer_->getGuiManager()->modalOverlay()->hasPendingRequest())))))) {
             pending_imports_.push_back(cmd);
             return;
         }
+        startLoadFileCommand(cmd);
+    }
+
+    void DataLoadingService::startLoadFileCommand(
+        const lfs::core::events::cmd::LoadFile& cmd) {
         if (viewer_ && viewer_->preflightLoadFileWipe(cmd)) {
             return;
         }
@@ -75,14 +88,29 @@ namespace lfs::vis {
             return;
         }
 
+        bool project_hydrating = false;
+        if (viewer_) {
+            const auto project_info = viewer_->projectGetInfo();
+            project_hydrating = project_info &&
+                                project_info->hydration_state ==
+                                    "hydrating";
+        }
+        const bool additive_during_hydration =
+            project_hydrating &&
+            scene_manager_->getContentType() !=
+                SceneManager::ContentType::Dataset;
+
         // Checkpoint files get special handling - redirect to training resume flow
         if (isCheckpointFile(cmd.path)) {
             handleLoadCheckpointForTrainingCommand(cmd.path, {}, {});
             return;
         }
 
+        // An additive load during hydration joins the project being opened; an
+        // explicit replacement still clears it.
         const bool replace_scene =
-            viewer_ ? viewer_->loadFileWouldReplaceScene(false, cmd.replace)
+            viewer_ ? ((cmd.replace || !additive_during_hydration) &&
+                       viewer_->loadFileWouldReplaceScene(false, cmd.replace))
                     : (cmd.replace ||
                        scene_manager_->getContentType() ==
                            SceneManager::ContentType::Dataset);
@@ -94,8 +122,17 @@ namespace lfs::vis {
                     .emit();
                 return;
             }
-            if (viewer_ && !viewer_->resetUntitledSessionForReplaceLoad()) {
-                return;
+            if (viewer_) {
+                // The confirmed UI-drop head replaces the scene, but later drops
+                // still belong to its queue. Explicit API/project clears retain
+                // their normal cancellation behavior.
+                auto queued_drops = cmd.user_batch ? std::move(pending_imports_)
+                                                   : decltype(pending_imports_){};
+                const bool reset = viewer_->resetUntitledSessionForReplaceLoad();
+                if (cmd.user_batch)
+                    pending_imports_ = std::move(queued_drops);
+                if (!reset)
+                    return;
             }
         }
 
@@ -105,8 +142,11 @@ namespace lfs::vis {
                                    : cmd.paths;
             // The first successful file binds the application scene. Subsequent
             // files in this batch and later queued batches append to it.
-            const bool replace_first = cmd.replace ||
-                                       scene_manager_->getContentType() != SceneManager::ContentType::SplatFiles;
+            const bool replace_first =
+                cmd.replace ||
+                (!additive_during_hydration &&
+                 scene_manager_->getContentType() !=
+                     SceneManager::ContentType::SplatFiles);
             if (!viewer_ || !viewer_->getGuiManager() ||
                 !viewer_->getGuiManager()->asyncTasks().startSplatLoad(paths, replace_first, {}, {}, std::nullopt, cmd.user_batch && paths.size() > 1)) {
                 throw std::runtime_error("Import already in progress");
@@ -118,11 +158,16 @@ namespace lfs::vis {
     }
 
     void DataLoadingService::processPendingImports() {
-        while (!pending_imports_.empty() && viewer_ && viewer_->getGuiManager() &&
-               !viewer_->getGuiManager()->asyncTasks().isImporting()) {
+        // A confirmation may defer the head request without starting an import.
+        // Do not drain later drops through that modal or in the same poll.
+        if (!pending_imports_.empty() && viewer_ && viewer_->getGuiManager() &&
+            !viewer_->getGuiManager()->asyncTasks().isImporting() &&
+            (!viewer_->getGuiManager()->modalOverlay() ||
+             (!viewer_->getGuiManager()->modalOverlay()->isOpen() &&
+              !viewer_->getGuiManager()->modalOverlay()->hasPendingRequest()))) {
             auto command = std::move(pending_imports_.front());
             pending_imports_.pop_front();
-            handleLoadFileCommand(command);
+            startLoadFileCommand(command);
         }
     }
 

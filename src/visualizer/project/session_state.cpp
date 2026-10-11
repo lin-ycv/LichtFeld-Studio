@@ -61,6 +61,11 @@ namespace lfs::vis::project {
 
         using Json = SessionJson;
 
+        bool is_builtin_environment(const std::string_view path) {
+            return path == lfs::vis::kDefaultEnvironmentMapPath ||
+                   path == "environments/alps_field_1k.hdr";
+        }
+
         lfs::Error session_state_error(
             const lfs::ErrorCode code,
             std::string detail,
@@ -345,6 +350,18 @@ namespace lfs::vis::project {
                     (void)assign_optional(
                         json, field, destination.*member);
                     return lfs::Result<void>{}; },
+            };
+        }
+
+        // Written for earlier readers, which require the key; ignored when reading.
+        template <typename Owner>
+        JsonField<Owner> legacy_vec3_field(
+            const std::string_view name,
+            const glm::vec3 value) {
+            return {
+                .name = name,
+                .write = [value](const Owner&) { return vec3_json(value); },
+                .read = [](const Json&, Owner&, std::string_view, std::string_view) { return lfs::Result<void>{}; },
             };
         }
 
@@ -652,8 +669,7 @@ namespace lfs::vis::project {
                 custom_field<RenderSettings>(
                     "environment_builtin",
                     [](const RenderSettings& settings) {
-                        return settings.environment_map_path ==
-                                       lfs::vis::kDefaultEnvironmentMapPath
+                        return is_builtin_environment(settings.environment_map_path)
                                    ? Json(settings.environment_map_path)
                                    : Json(nullptr);
                     },
@@ -753,7 +769,8 @@ namespace lfs::vis::project {
                            [](RenderSettings& settings) {
                                sanitizeDepthViewSettings(settings);
                            }),
-                vec3_field("selection_color_committed", &RenderSettings::selection_color_committed),
+                // Removed setting; builds before its removal fail to open a project without it.
+                legacy_vec3_field<RenderSettings>("selection_color_committed", {0.859f, 0.325f, 0.325f}),
                 vec3_field("selection_color_preview", &RenderSettings::selection_color_preview),
                 vec3_field("selection_color_center_marker", &RenderSettings::selection_color_center_marker),
                 required_field("depth_clip_enabled", &RenderSettings::depth_clip_enabled),
@@ -2259,8 +2276,7 @@ namespace lfs::vis::project {
         auto project_render_settings =
             renderSettingsToProjectJson(settings);
         if (!settings.environment_map_path.empty() &&
-            settings.environment_map_path !=
-                lfs::vis::kDefaultEnvironmentMapPath) {
+            !is_builtin_environment(settings.environment_map_path)) {
             std::optional<lfs::core::Uuid>
                 retained_uuid;
             const auto retained_reference =
@@ -2616,6 +2632,17 @@ namespace lfs::vis::project {
                         sequencer_known);
             !merged) {
             return std::move(merged).error();
+        }
+        // The live timeline owns the key list. The additive merge preserves
+        // extension fields on surviving keys, but must not retain removed tails.
+        const auto keyframe_count = sequencer_known["timeline"]["keyframes"].size();
+        if (const auto* merged_keys = result.sequencer.dom().get_json_ref("timeline.keyframes");
+            merged_keys && merged_keys->is_array() && merged_keys->size() > keyframe_count) {
+            Json current_keys(merged_keys->begin(), merged_keys->begin() + keyframe_count);
+            if (auto set = result.sequencer.dom().set_json("timeline.keyframes", std::move(current_keys));
+                !set) {
+                return std::move(set).error();
+            }
         }
         if (auto merged_clips =
                 result.sequencer.dom()
@@ -3579,26 +3606,12 @@ namespace lfs::vis::project {
                             // Disabled constructor-default boxes are not in near/far encoding.
                             if (settings
                                     ->depth_filter_enabled) {
-                                const float near_plane =
-                                    std::max(0.0f,
-                                             -settings
-                                                  ->depth_filter_max.z);
-                                const float far_plane =
-                                    std::max(near_plane + 0.01f,
-                                             -settings
-                                                  ->depth_filter_min.z);
-                                const float half_width =
-                                    std::max(
-                                        std::abs(settings
-                                                     ->depth_filter_min.x),
-                                        std::abs(settings
-                                                     ->depth_filter_max.x));
                                 selection_tool
-                                    ->setDepthFilterRange(
-                                        settings
-                                            ->depth_filter_enabled,
-                                        near_plane, far_plane,
-                                        half_width);
+                                    ->restoreDepthFilterBox(
+                                        settings->depth_filter_min,
+                                        settings->depth_filter_max,
+                                        settings->split_view_mode ==
+                                            SplitViewMode::IndependentDual);
                             }
                             auto restored =
                                 rendering->getSettings();

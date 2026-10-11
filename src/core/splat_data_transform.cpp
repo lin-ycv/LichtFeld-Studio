@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <format>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <limits>
@@ -1046,6 +1047,75 @@ namespace lfs::core {
 
         (void)result.apply_shN_value_quant();
         return result;
+    }
+
+    lfs::Result<SplatData> extract_lod_leaves(const SplatData& splat_data) {
+        LFS_ASSERT(splat_data.lod_tree && splat_data.lod_tree->has_tree());
+        const SplatLodTree& tree = *splat_data.lod_tree;
+        const size_t node_count = tree.total_nodes();
+        if (splat_data.size() < node_count) {
+            return lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::FailedPrecondition,
+                .domain = lfs::ErrorDomain::Core,
+                .detail = std::format(
+                    "only {} of {} LOD nodes are in memory; the full-detail splats stream from disk",
+                    splat_data.size(), node_count),
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            });
+        }
+        LFS_ASSERT(splat_data.size() == node_count);
+
+        std::vector<bool> is_leaf(node_count);
+        for (size_t i = 0; i < node_count; ++i) {
+            is_leaf[i] = tree.child_count_at(i) == 0;
+        }
+        Tensor keep = Tensor::from_vector(is_leaf, {node_count}, splat_data.means_raw().device());
+        if (splat_data.has_deleted_mask()) {
+            keep = keep.logical_and(splat_data.deleted().logical_not());
+        }
+
+        SplatData leaves = extract_by_mask(splat_data, keep);
+        leaves.lod_tree.reset();
+        if (tree.lod_opacity_encoded && leaves.size() > 0) {
+            leaves.opacity_raw() = leaves.opacity_raw().logit();
+        }
+        return leaves;
+    }
+
+    std::shared_ptr<SplatData> make_lod_leaf_view(const SplatData& splat_data) {
+        LFS_ASSERT(splat_data.lod_tree && splat_data.lod_tree->has_tree());
+        const SplatLodTree& tree = *splat_data.lod_tree;
+        const size_t rows = splat_data.size();
+        LFS_ASSERT(rows <= tree.total_nodes());
+
+        auto view = std::make_shared<SplatData>(
+            splat_data.get_max_sh_degree(),
+            splat_data.means_raw(),
+            splat_data.sh0_raw(),
+            splat_data.shN_raw().is_valid() ? splat_data.shN_raw() : Tensor{},
+            splat_data.scaling_raw(),
+            splat_data.rotation_raw(),
+            tree.lod_opacity_encoded ? splat_data.opacity_raw().logit() : splat_data.opacity_raw(),
+            splat_data.get_scene_scale(),
+            SplatData::ShNLayout::Swizzled);
+        view->set_active_sh_degree(
+            splat_data.get_active_sh_degree(),
+            splat_data.shN_value_quantized() && splat_data.shN_value_bounds().is_valid()
+                ? splat_data.shN_value_bounds()
+                : Tensor{});
+
+        std::vector<bool> interior(rows);
+        for (size_t i = 0; i < rows; ++i) {
+            interior[i] = tree.child_count_at(i) != 0;
+        }
+        Tensor hidden = Tensor::from_vector(interior, {rows}, splat_data.means_raw().device());
+        if (splat_data.has_deleted_mask()) {
+            hidden = hidden.logical_or(splat_data.deleted());
+        }
+        view->deleted() = std::move(hidden);
+        view->notify_deleted_mask_changed();
+        view->refresh_deleted_count();
+        return view;
     }
 
 } // namespace lfs::core

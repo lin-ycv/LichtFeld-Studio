@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Sequence
 import enum
-from typing import TypeAlias, overload
+from typing import Annotated, TypeAlias, overload
 
 from numpy.typing import NDArray
 import typing_extensions
@@ -297,6 +297,9 @@ def project_save(wait: bool = False, regenerate_preview: bool = True) -> bool:
 def project_save_as(path: str = '', wait: bool = False) -> bool:
     """Save the active project to a new .licht path"""
 
+def project_save_as_for_training_start(path: str = '', wait: bool = False) -> bool:
+    """Save a clean project for a new training run"""
+
 def project_get_license() -> dict | None:
     """Return the license metadata for the active project, or None"""
 
@@ -385,7 +388,7 @@ def clear_scene() -> None:
 def switch_to_edit_mode() -> None:
     """Switch from training to edit mode"""
 
-def load_file(path: str, is_dataset: bool = False, output_path: str = '', init_path: str = '', centralize_dataset: str = 'off', max_width: int | None = None, apply_auto_crop: bool = False, min_track_length: int | None = None, stop_training: bool = False, discard_changes: bool = False, replace: bool = False) -> None:
+def load_file(path: str, is_dataset: bool = False, output_path: str = '', init_path: str = '', centralize_dataset: str = 'off', max_width: int | None = None, apply_auto_crop: bool = False, min_track_length: int | None = None, stop_training: bool = False, discard_changes: bool = False, replace: bool = False, images_folder: str = '') -> None:
     """Load a file (PLY, checkpoint) or dataset into the scene."""
 
 def load_files(paths: Sequence[str], stop_training: bool = False, discard_changes: bool = False, replace: bool = False, _user_batch: bool = False) -> None:
@@ -570,11 +573,20 @@ def get_colmap_sparse_source_path() -> str | None:
 def get_node_visualizer_world_transform(name: str) -> list[float] | None:
     """Get node visualizer-world transform matrix (16 floats, column-major)"""
 
-def set_node_transform(name: str, matrix: Sequence[float]) -> None:
-    """Set node transform matrix (16 floats, column-major)"""
+def commit_node_transforms(node_names: Sequence[str], old_transforms: Sequence[Sequence[float]]) -> None:
+    """
+    Record a completed preview edit as one undo step using its original local transforms
+    """
 
-def set_node_visualizer_world_transform(name: str, matrix: Sequence[float]) -> None:
-    """Set node visualizer-world transform matrix (16 floats, column-major)"""
+def set_node_transform(name: str, matrix: Sequence[float], *, record_history: bool = True) -> None:
+    """
+    Set node transform matrix (16 floats, column-major). Disable record_history for previews committed with commit_node_transforms.
+    """
+
+def set_node_visualizer_world_transform(name: str, matrix: Sequence[float], *, record_history: bool = True) -> None:
+    """
+    Set node visualizer-world transform matrix (16 floats, column-major). Disable record_history for previews committed with commit_node_transforms.
+    """
 
 def bake_selected_node_transforms() -> int:
     """
@@ -767,7 +779,7 @@ class Tensor:
         """Count non-zero elements"""
 
     @staticmethod
-    def from_numpy(arr: NDArray, copy: bool = True) -> Tensor:
+    def from_numpy(arr: Annotated[NDArray, dict(device='cpu')], copy: bool = True) -> Tensor:
         """Create tensor from NumPy array"""
 
     @staticmethod
@@ -816,10 +828,10 @@ class Tensor:
     def from_dlpack(obj: object) -> Tensor:
         """Create tensor from DLPack capsule or object"""
 
-    def __getitem__(self, arg: object, /) -> Tensor:
+    def __getitem__(self, key: object | None) -> Tensor:
         """Get item/slice"""
 
-    def __setitem__(self, arg0: object, arg1: object, /) -> None:
+    def __setitem__(self, key: object | None, value: object) -> None:
         """Set item/slice"""
 
     @overload
@@ -1980,6 +1992,15 @@ class EvalSpace(enum.Enum):
 
     UNDISTORTED = 1
 
+class EvalBitDepth(enum.Enum):
+    AUTO = 0
+
+    EIGHT = 1
+
+    SIXTEEN = 2
+
+    FLOAT = 3
+
 class DensifyErrorMap(enum.Enum):
     SSIM = 0
 
@@ -2156,68 +2177,38 @@ class OptimizationParams:
     def eval_all(self, arg: bool, /) -> None: ...
 
     @property
+    def eval_flip(self) -> bool:
+        """
+        Also compute FLIP per evaluated image and save its error map next to the evaluation images
+        """
+
+    @eval_flip.setter
+    def eval_flip(self, arg: bool, /) -> None: ...
+
+    @property
     def eval_mask(self) -> str:
-        """Absolute mesh path used to select evaluated pixels"""
+        """
+        Scores only part of each evaluated image (a mesh, a box, the crop box, a mask folder, a depth range, points or a splat); training is not affected
+        """
 
     @eval_mask.setter
     def eval_mask(self, arg: str, /) -> None: ...
 
     @property
     def eval_mask_invert(self) -> bool:
-        """Evaluate pixels outside the mesh coverage"""
+        """Scores the pixels outside the evaluation mask instead"""
 
     @eval_mask_invert.setter
     def eval_mask_invert(self, arg: bool, /) -> None: ...
 
     @property
-    def background_improvements(self) -> bool:
+    def eval_mask_opacity(self) -> float:
         """
-        Improve distant background reconstruction (MRNF): far-field seeding and splits, decay relief, growth cap, per-splat position steps, visibility-ratio growth ranking, paced capacity fill
-        """
-
-    @background_improvements.setter
-    def background_improvements(self, arg: bool, /) -> None: ...
-
-    @property
-    def far_scene_min_fraction(self) -> float:
-        """
-        Minimum deep-far splat fraction that activates far-field features (0 = always on)
+        Rendered opacity a pixel needs to count as covered by a splat mask; lower widens the mask past the outline, higher pulls it in
         """
 
-    @far_scene_min_fraction.setter
-    def far_scene_min_fraction(self, arg: float, /) -> None: ...
-
-    @property
-    def growth_ratio_rank(self) -> bool:
-        """
-        Rank MRNF growth by visibility-normalized error (err/vis^p) instead of raw window error
-        """
-
-    @growth_ratio_rank.setter
-    def growth_ratio_rank(self, arg: bool, /) -> None: ...
-
-    @property
-    def growth_ratio_pow(self) -> float:
-        """Visibility exponent p for the err/vis^p growth rank"""
-
-    @growth_ratio_pow.setter
-    def growth_ratio_pow(self, arg: float, /) -> None: ...
-
-    @property
-    def fill_pacing_iter(self) -> int:
-        """Pace MRNF cap fill until this iteration (0 = fill as fast as possible)"""
-
-    @fill_pacing_iter.setter
-    def fill_pacing_iter(self, arg: int, /) -> None: ...
-
-    @property
-    def far_seed_dose(self) -> int:
-        """
-        Far-field seeds injected per refine window (0 = starvation-scaled default)
-        """
-
-    @far_seed_dose.setter
-    def far_seed_dose(self, arg: int, /) -> None: ...
+    @eval_mask_opacity.setter
+    def eval_mask_opacity(self, arg: float, /) -> None: ...
 
     @property
     def densify_error_map(self) -> DensifyErrorMap:
@@ -2241,15 +2232,6 @@ class OptimizationParams:
 
     @screen_share_penalty.setter
     def screen_share_penalty(self, arg: float, /) -> None: ...
-
-    @property
-    def oversize_split_fraction(self) -> float:
-        """
-        Fraction of MRNF growth budget used to split Gaussians over the screen-share cap; 0 disables
-        """
-
-    @oversize_split_fraction.setter
-    def oversize_split_fraction(self, arg: float, /) -> None: ...
 
     @property
     def steps_scaler(self) -> float:
@@ -2437,6 +2419,15 @@ class OptimizationParams:
     def depth_loss_mode(self, arg: str, /) -> None: ...
 
     @property
+    def depth_auto_generate(self) -> bool:
+        """
+        Generate missing or size-mismatched depth maps with MoGe-2 from the full-resolution images/ folder
+        """
+
+    @depth_auto_generate.setter
+    def depth_auto_generate(self, arg: bool, /) -> None: ...
+
+    @property
     def use_normal_loss(self) -> bool:
         """Load normal maps and use normal-map supervision during training"""
 
@@ -2515,6 +2506,15 @@ class OptimizationParams:
 
     @eval_space.setter
     def eval_space(self, arg: EvalSpace, /) -> None: ...
+
+    @property
+    def eval_bit_depth(self) -> EvalBitDepth:
+        """
+        Grid the render is quantized to before evaluation metrics: auto = each reference image's own encoding (8-bit, 16-bit or float)
+        """
+
+    @eval_bit_depth.setter
+    def eval_bit_depth(self, arg: EvalBitDepth, /) -> None: ...
 
     @property
     def save_steps(self) -> list[int]:

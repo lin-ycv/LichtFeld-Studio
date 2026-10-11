@@ -45,7 +45,7 @@ class GalleryAssetMixin:
         self._gallery_unsubscribe = None
         self._gallery_state = {"scenes": [], "links": {}, "jobs": [], "signed_in": False}
         self._gallery_rows_generation = 0
-        self._gallery_upload_format = "sog"
+        self._gallery_upload_format = "auto"
         self._gallery_pull_folder = ""
         self._gallery_pull_name = ""
         self._gallery_batch = []
@@ -720,7 +720,8 @@ class GalleryAssetMixin:
         quota, used, _ = gallery_quota(self._gallery_state)
         if quota is None:
             return ""
-        return tr("quota.used", used=f"{used / 1e9:.1f}", quota=f"{quota / 1e9:g}")
+        from .gallery_storage import quota_message
+        return quota_message(self._gallery_state)
 
     def _gallery_quota_warning(self):
         quota, used, _ = gallery_quota(self._gallery_state)
@@ -765,6 +766,7 @@ class GalleryAssetMixin:
             if completion["kind"] == "remove":
                 self._show_gallery_toast(tr("toast.removed", title=completion["title"]))
             elif completion.get("scene"):
+                self._gallery_notice = ""
                 self._show_gallery_toast(tr("toast.published", title=completion["scene"].get("title", "")), scene=copy.deepcopy(completion["scene"]))
         pulled = snapshot.get("pulledProject")
         if pulled and pulled != previous.get("pulledProject"):

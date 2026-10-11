@@ -503,7 +503,9 @@ namespace lfs::vis {
                 }));
             callback_cleanup_.add([token] { token->reset(); });
         };
-        bind_view_input(app_store().scene_generation, DirtyFlag::ALL, FrameReason::SceneChange);
+        // Scene publishes geometry invalidation directly. Its UI generation also
+        // changes for matrices, which must retain the resident splat inputs.
+        bind_view_input(app_store().scene_generation, DirtyFlag::MESH | DirtyFlag::OVERLAY, FrameReason::SceneChange);
         bind_view_input(app_store().selection_generation, DirtyFlag::SELECTION | DirtyFlag::OVERLAY, FrameReason::Selection);
         bind_view_input(app_store().render_settings_generation, DirtyFlag::ALL, FrameReason::SettingsChange);
         auto active_tool_poll_cache_token = std::make_shared<core::reactive::SubscriptionToken>(
@@ -760,7 +762,7 @@ namespace lfs::vis {
             },
             []() {
                 if (auto* gm = python::get_gui_manager()) {
-                    gm->sequencer().clear();
+                    gm->sequencer().clearKeyframes();
                     lfs::core::events::state::KeyframeListChanged{.count = 0}.emit();
                 }
             },
@@ -1132,7 +1134,10 @@ namespace lfs::vis {
                 const std::string previous_upscaler = s.scene_upscaler;
                 const std::string previous_preset = s.scene_upscaler_preset;
                 vis::apply_proxy(s, proxy);
-                rendering_manager_->updateSettings(s);
+                if (const auto result = rendering_manager_->updateSettingsFromUser(s); !result) {
+                    wakeMainLoop();
+                    throw std::invalid_argument(std::string(result.error().user_message()));
+                }
                 const auto& applied = rendering_manager_->getSettings();
                 if (applied.scene_upscaler != previous_upscaler ||
                     applied.scene_upscaler_preset != previous_preset) {
@@ -1596,10 +1601,13 @@ namespace lfs::vis {
                 if (path.empty()) {
                     return;
                 }
-                if (auto saved =
-                        command.path.empty()
-                            ? projectSaveAsFromDialog(path, true)
-                            : projectSaveAs(path, true);
+                if (auto saved = command.path.empty()
+                                     ? projectSaveAsFromDialog(
+                                           path, true,
+                                           command.fresh_training_start)
+                                     : projectSaveAs(
+                                           path, true,
+                                           command.fresh_training_start);
                     !saved) {
                     publish_project_error(
                         "Save Project As",
@@ -1984,8 +1992,6 @@ namespace lfs::vis {
                 .enabled = false,
                 .voxel_size = 0.01f}
                 .emit();
-
-            LOG_INFO("Switched to splat rendering mode (training started)");
         });
 
         state::TrainingResumed::when([sync_viewer_mip_filter_with_training](const auto&) {
@@ -2023,7 +2029,7 @@ namespace lfs::vis {
         });
 
         state::TrainingPaused::when([this](const auto& event) {
-            training_progress_publisher_.publishFinal(event.iteration);
+            training_progress_publisher_.publishFinal(event.iteration, trainer_manager_->getNumSplats());
             auto& store = app_store();
             lfs::core::reactive::BatchUpdate batch(store.store());
             store.training_running.set(false);
@@ -2040,7 +2046,7 @@ namespace lfs::vis {
         });
 
         state::TrainingCompleted::when([this](const auto& event) {
-            training_progress_publisher_.publishFinal(event.iteration);
+            training_progress_publisher_.publishFinal(event.iteration, trainer_manager_->getNumSplats());
             const char* state = !event.success       ? "error"
                                 : event.user_stopped ? "stopped"
                                                      : "completed";
@@ -2282,6 +2288,9 @@ namespace lfs::vis {
         if (selection_tool_ && selection_tool_->isEnabled() && tool_context_) {
             selection_tool_->update(*tool_context_);
         }
+        if (align_tool_ && align_tool_->isEnabled() && tool_context_) {
+            align_tool_->update(*tool_context_);
+        }
 
         if (!gui_frame_rendered_) {
             // Wait for at least one GUI frame to render before loading data
@@ -2293,13 +2302,16 @@ namespace lfs::vis {
             }
         } else if (!pending_dataset_path_.empty()) {
             auto path = std::exchange(pending_dataset_path_, {});
-            LOG_INFO("Queueing dataset import: {}", lfs::core::path_to_utf8(path));
             const auto& params = data_loader_->getParameters();
             cmd::LoadFile{
                 .path = path,
                 .is_dataset = true,
                 .output_path = params.dataset.output_path,
                 .init_path = params.init_path.value_or(std::string{}),
+                .add_splat_paths = params.add_splat_paths,
+                .add_splat_freeze = params.add_splat_freeze,
+                .freeze_lr_scale = params.freeze_lr_scale,
+                .exclude_frozen_add_splats_from_export = params.exclude_frozen_add_splats_from_export,
                 .centralize_dataset = params.dataset.centralize_dataset,
             }
                 .emit();
@@ -2742,7 +2754,7 @@ namespace lfs::vis {
         RenderingManager::RenderContext context{
             .viewport = viewport_,
             .settings = rendering_manager_->getSettings(),
-            .logical_screen_size = window_manager_->getWindowSize(),
+            .screen_size_px = window_manager_->getFramebufferSize(),
             .viewport_region = has_viewport_region ? &viewport_region : nullptr,
             .scene_manager = scene_manager_.get(),
             .vulkan_context = window_manager_->getVulkanContext()};
@@ -3289,14 +3301,7 @@ namespace lfs::vis {
         if (trainer_manager_ &&
             (trainer_manager_->isTrainingActive() ||
              trainer_manager_->isCompletionPending())) {
-            cmd::LoadFile{
-                .path = path,
-                .is_dataset = false,
-                .stop_training = true,
-                .discard_changes = true,
-                .replace = true}
-                .emit();
-            return {};
+            return std::unexpected("Cannot replace the scene until training has stopped.");
         }
         return data_loader_->loadPLY(path);
     }
@@ -3542,7 +3547,8 @@ namespace lfs::vis {
                 lfs::core::events::cmd::
                     ShowProjectSwitchConfirmation{
                         .new_project = true,
-                        .path = {}}
+                        .path = {},
+                        .stop_training = stop_training}
                         .emit();
                 return;
             }
@@ -3675,7 +3681,8 @@ namespace lfs::vis {
                     .path = {},
                     .create_path = path,
                     .allow_existing_destination_replacement =
-                        allow_existing_destination_replacement}
+                        allow_existing_destination_replacement,
+                    .stop_training = stop_training}
                     .emit();
                 return preflight;
             }
@@ -3793,7 +3800,8 @@ namespace lfs::vis {
                         .new_project = false,
                         .path = path,
                         .keep_asset_manager_open =
-                            keep_asset_manager_open}
+                            keep_asset_manager_open,
+                        .stop_training = stop_training}
                         .emit();
                 return;
             }
@@ -4129,6 +4137,8 @@ namespace lfs::vis {
     }
 
     std::expected<void, std::string> VisualizerImpl::startTraining() {
+        if (isTrainingStartPending())
+            return {};
         if (!trainer_manager_)
             return std::unexpected("Trainer manager not initialized");
         if (project_lifecycle_ &&
@@ -4157,12 +4167,18 @@ namespace lfs::vis {
                         !policy.at_step_boundaries) {
                         if (auto prepared =
                                 project_lifecycle_
-                                    ->prepareTrainingStartProject();
+                                    ->prepareTrainingStartProjectAsync([this]() -> lfs::Result<void> {
+                                        if (trainer_manager_->isPaused()) {
+                                            trainer_manager_->resumeTraining();
+                                        }
+                                        return {};
+                                    });
                             !prepared) {
                             return std::unexpected(
                                 lfs::format_for_developer(
                                     prepared.error()));
                         }
+                        return {};
                     }
                 }
             }
@@ -4193,12 +4209,21 @@ namespace lfs::vis {
         if (project_lifecycle_) {
             if (auto prepared =
                     project_lifecycle_
-                        ->prepareTrainingStartProject();
+                        ->prepareTrainingStartProjectAsync([this]() -> lfs::Result<void> {
+                            if (!trainer_manager_->startTraining()) {
+                                return visualizerFailure<void>(
+                                    lfs::ErrorCode::FailedPrecondition,
+                                    "The training manager rejected the start request.",
+                                    "Training start rejected after project preparation", "training.start");
+                            }
+                            return {};
+                        });
                 !prepared) {
                 return std::unexpected(
                     lfs::format_for_developer(
                         prepared.error()));
             }
+            return {};
         }
         if (!trainer_manager_->startTraining())
             return std::unexpected("The training manager rejected the start request");
@@ -4232,6 +4257,14 @@ namespace lfs::vis {
     VisualizerImpl::projectSaveAs(
         const std::filesystem::path& path,
         const bool regenerate_preview) {
+        return projectSaveAs(path, regenerate_preview, false);
+    }
+
+    lfs::Result<void>
+    VisualizerImpl::projectSaveAs(
+        const std::filesystem::path& path,
+        const bool regenerate_preview,
+        const bool fresh_training_start) {
         if (!project_lifecycle_) {
             return visualizerFailure<void>(
                 lfs::ErrorCode::Unavailable,
@@ -4240,7 +4273,8 @@ namespace lfs::vis {
                 "project.lifecycle");
         }
         return project_lifecycle_->saveAs(
-            path, regenerate_preview);
+            path, regenerate_preview, false,
+            fresh_training_start);
     }
 
     lfs::Result<void>
@@ -4278,7 +4312,8 @@ namespace lfs::vis {
     lfs::Result<void>
     VisualizerImpl::projectSaveAsFromDialog(
         const std::filesystem::path& path,
-        const bool regenerate_preview) {
+        const bool regenerate_preview,
+        const bool fresh_training_start) {
         if (!project_lifecycle_) {
             return visualizerFailure<void>(
                 lfs::ErrorCode::Unavailable,
@@ -4287,7 +4322,8 @@ namespace lfs::vis {
                 "project.lifecycle");
         }
         return project_lifecycle_->saveAs(
-            path, regenerate_preview, true);
+            path, regenerate_preview, true,
+            fresh_training_start);
     }
 
     bool VisualizerImpl::projectContainsEmbeddedSecrets()
@@ -4621,7 +4657,8 @@ namespace lfs::vis {
         const auto preserved_camera = viewport_.camera;
         const auto preserved_transforms = collectResetTransforms(scene_manager_->getScene());
 
-        const auto& init_path = data_loader_->getParameters().init_path;
+        const auto& previous_params = data_loader_->getParameters();
+        const auto& init_path = previous_params.init_path;
         std::optional<lfs::core::param::TrainingParameters> reset_params;
         if (auto* const param_mgr = services().paramsOrNull(); param_mgr && param_mgr->ensureLoaded()) {
             reset_params = param_mgr->createForDataset(path, {});
@@ -4629,6 +4666,10 @@ namespace lfs::vis {
                 reset_params->dataset = trainer_manager_->getEditableDatasetParams();
                 reset_params->dataset.data_path = path;
                 reset_params->init_path = init_path;
+                reset_params->add_splat_paths = previous_params.add_splat_paths;
+                reset_params->add_splat_freeze = previous_params.add_splat_freeze;
+                reset_params->freeze_lr_scale = previous_params.freeze_lr_scale;
+                reset_params->exclude_frozen_add_splats_from_export = previous_params.exclude_frozen_add_splats_from_export;
             }
             data_loader_->setParameters(*reset_params);
         }
